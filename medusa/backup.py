@@ -163,7 +163,6 @@ def main(config, backup_name_arg, stagger_time, mode):
     try:
         storage = Storage(config=config.storage)
         cassandra = Cassandra(config.cassandra)
-        chunk_size = config.storage.multi_part_chunk_size
 
         differential_mode = False
         if mode == "differential":
