@@ -23,6 +23,7 @@ import psutil
 import sys
 import time
 import traceback
+import subprocess
 
 from libcloud.storage.providers import Provider
 from retrying import retry
@@ -181,6 +182,12 @@ def main(config, backup_name_arg, stagger_time, mode):
             throttle_backup()
         except Exception:
             logging.warning("Throttling backup impossible. It's probable that ionice is not available.")
+        
+        if is_aws_s3(self._storage_provider):
+            try:
+                subprocess.call(['aws','configure','set','s3.multipart_chunksize',config.storage.multi_part_chunk_size])
+            except Exception:
+                logging.warning("Could not set AWS config")
 
         logging.info('Creating snapshot')
         logging.info('Saving tokenmap and schema')
