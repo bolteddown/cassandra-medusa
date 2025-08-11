@@ -82,20 +82,44 @@ class GoogleStorage(AbstractStorage):
             logging.error('Error disconnecting from Google Storage: {}'.format(e))
 
     async def _list_blobs(self, prefix=None) -> t.List[AbstractBlob]:
-        self._ensure_session()
         objects = self._paginate_objects(prefix=prefix)
 
-        return [
-            AbstractBlob(
-                o['name'],
-                int(o['size']),
-                o['md5Hash'],
-                # datetime comes as a string like 2023-08-31T14:23:24.957Z
-                datetime.datetime.strptime(o['timeCreated'], '%Y-%m-%dT%H:%M:%S.%fZ'),
-                o['storageClass']
-            )
-            async for o in objects
-        ]
+        blobs: t.List[AbstractBlob] = []
+        async for o in objects:
+            # name is required; skip entries without it
+            name = o.get('name')
+            if not name:
+                continue
+
+            # size may be a string or missing
+            size_raw = o.get('size')
+            try:
+                size = int(size_raw) if size_raw is not None else 0
+            except (TypeError, ValueError):
+                size = 0
+
+            # md5Hash is NOT guaranteed to exist (e.g., CMEK/CSEK or composite objects)
+            md5 = o.get('md5Hash')  # may be None; downstream code must tolerate this
+
+            # Prefer timeCreated; fall back to updated; handle both with/without microseconds
+            ts = o.get('timeCreated') or o.get('updated')
+            dt = None
+            if ts:
+                for fmt in ('%Y-%m-%dT%H:%M:%S.%fZ', '%Y-%m-%dT%H:%M:%SZ'):
+                    try:
+                        dt = datetime.datetime.strptime(ts, fmt)
+                        break
+                    except ValueError:
+                        pass
+            if dt is None:
+                # Last resort; epoch so callers get a datetime
+                dt = datetime.datetime.utcfromtimestamp(0)
+
+            storage_class = o.get('storageClass')
+
+            blobs.append(AbstractBlob(name, size, md5, dt, storage_class))
+
+        return blobs
 
     async def _paginate_objects(self, prefix=None):
 
