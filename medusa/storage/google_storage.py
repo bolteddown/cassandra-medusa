@@ -29,12 +29,56 @@ from retrying import retry
 
 from gcloud.aio.storage import Storage
 
-from medusa.storage.abstract_storage import AbstractStorage, AbstractBlob, ManifestObject, ObjectDoesNotExistError
+from medusa.storage.abstract_storage import (
+    AbstractStorage,
+    AbstractBlob,
+    ManifestObject,
+    ObjectDoesNotExistError,
+)
 
 
 DOWNLOAD_STREAM_CONSUMPTION_CHUNK_SIZE = 1024 * 1024 * 5
 GOOGLE_MAX_FILES_PER_CHUNK = 64
 MAX_UP_DOWN_LOAD_RETRIES = 5
+
+
+# -------------------------------
+# Helpers
+# -------------------------------
+
+def _parse_gcs_datetime(ts: str) -> datetime.datetime:
+    """Parse GCS RFC3339-like timestamps with or without fractional seconds.
+
+    Examples from GCS:
+      2023-08-31T14:23:24.957Z
+      2023-08-31T14:23:24Z
+    """
+    if not ts:
+        return datetime.datetime.utcfromtimestamp(0)
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ"):
+        try:
+            return datetime.datetime.strptime(ts, fmt)
+        except ValueError:
+            continue
+    # Fallback
+    return datetime.datetime.utcfromtimestamp(0)
+
+
+def _safe_md5_from_dict(d: dict) -> t.Optional[str]:
+    """Return md5Hash from a metadata dict if present, else None.
+    Some GCS objects legitimately have no md5Hash (e.g., composites or certain upload paths).
+    """
+    return (d or {}).get("md5Hash")
+
+
+def _safe_b64_to_hex(b64_str: str) -> t.Optional[str]:
+    """Convert a base64 string into lowercase hex. Return None on errors or empty input."""
+    if not b64_str:
+        return None
+    try:
+        return base64.b64decode(b64_str).hex()
+    except Exception:
+        return None
 
 
 class GoogleStorage(AbstractStorage):
@@ -98,22 +142,12 @@ class GoogleStorage(AbstractStorage):
             except (TypeError, ValueError):
                 size = 0
 
-            # md5Hash is NOT guaranteed to exist (e.g., CMEK/CSEK or composite objects)
+            # md5Hash is NOT guaranteed to exist
             md5 = o.get('md5Hash')  # may be None; downstream code must tolerate this
 
-            # Prefer timeCreated; fall back to updated; handle both with/without microseconds
+            # Prefer timeCreated; fall back to updated
             ts = o.get('timeCreated') or o.get('updated')
-            dt = None
-            if ts:
-                for fmt in ('%Y-%m-%dT%H:%M:%S.%fZ', '%Y-%m-%dT%H:%M:%SZ'):
-                    try:
-                        dt = datetime.datetime.strptime(ts, fmt)
-                        break
-                    except ValueError:
-                        pass
-            if dt is None:
-                # Last resort; epoch so callers get a datetime
-                dt = datetime.datetime.utcfromtimestamp(0)
+            dt = _parse_gcs_datetime(ts)
 
             storage_class = o.get('storageClass')
 
@@ -168,8 +202,11 @@ class GoogleStorage(AbstractStorage):
             force_resumable_upload=True,
             timeout=-1,
         )
+        # md5Hash may be missing depending on how GCS created the object
+        md5 = _safe_md5_from_dict(resp)
+        time_created = resp.get('timeCreated')
         return AbstractBlob(
-            resp['name'], int(resp['size']), resp['md5Hash'], resp['timeCreated'], None
+            resp.get('name', object_key), int(resp.get('size', 0)), md5, _parse_gcs_datetime(time_created), None
         )
 
     @retry(stop_max_attempt_number=MAX_UP_DOWN_LOAD_RETRIES, wait_fixed=5000)
@@ -216,14 +253,13 @@ class GoogleStorage(AbstractStorage):
             object_name=object_key,
             timeout=self.read_timeout,
         )
-        return AbstractBlob(
-            blob['name'],
-            int(blob['size']),
-            blob['md5Hash'],
-            # datetime comes as a string like 2023-08-31T14:23:24.957Z
-            datetime.datetime.strptime(blob['timeCreated'], '%Y-%m-%dT%H:%M:%S.%fZ'),
-            blob['storageClass']
-        )
+        # Safe field extraction
+        name = blob.get('name', object_key)
+        size = int(blob.get('size', 0))
+        md5 = _safe_md5_from_dict(blob)
+        time_created = _parse_gcs_datetime(blob.get('timeCreated') or blob.get('updated'))
+        storage_class = blob.get('storageClass')
+        return AbstractBlob(name, size, md5, time_created, storage_class)
 
     @retry(stop_max_attempt_number=MAX_UP_DOWN_LOAD_RETRIES, wait_fixed=5000)
     async def _upload_blob(self, src: str, dest: str) -> ManifestObject:
@@ -247,7 +283,7 @@ class GoogleStorage(AbstractStorage):
                 new_name=object_key,
                 timeout=-1,
             )
-            resp = resp['resource']
+            resp = resp.get('resource', resp) or {}
         else:
             file_size = os.stat(src).st_size
             logging.debug(
@@ -263,7 +299,11 @@ class GoogleStorage(AbstractStorage):
                     force_resumable_upload=True,
                     timeout=-1,
                 )
-        mo = ManifestObject(resp['name'], int(resp['size']), resp['md5Hash'])
+        # Build ManifestObject; md5 may be None
+        name = resp.get('name', object_key)
+        size = int(resp.get('size', 0))
+        md5 = _safe_md5_from_dict(resp)
+        mo = ManifestObject(name, size, md5)
         return mo
 
     async def _get_object(self, object_key: str) -> AbstractBlob:
@@ -301,7 +341,7 @@ class GoogleStorage(AbstractStorage):
             actual_size=blob.size,
             size_in_manifest=object_in_manifest['size'],
             actual_hash=str(blob.hash) if enable_md5_checks else None,
-            hash_in_manifest=object_in_manifest['MD5']
+            hash_in_manifest=object_in_manifest.get('MD5'),
         )
 
     @staticmethod
@@ -310,7 +350,7 @@ class GoogleStorage(AbstractStorage):
             actual_size=src.stat().st_size,
             size_in_manifest=cached_item.size,
             actual_hash=AbstractStorage.generate_md5_hash(src) if enable_md5_checks else None,
-            hash_in_manifest=cached_item.MD5
+            hash_in_manifest=cached_item.MD5,
         )
 
     @staticmethod
@@ -319,10 +359,16 @@ class GoogleStorage(AbstractStorage):
         if not actual_hash:
             return sizes_match
 
-        actual_equals_encoded_in_manifest = actual_hash == base64.b64decode(hash_in_manifest).hex()
-        manifest_equals_encoded_in_actual = hash_in_manifest == base64.b64decode(actual_hash).hex()
+        # If a hash is provided locally but the manifest has no hash, we cannot verify
+        if not hash_in_manifest:
+            return False
+
+        actual_hex = _safe_b64_to_hex(actual_hash) or actual_hash
+        manifest_hex = _safe_b64_to_hex(hash_in_manifest) or hash_in_manifest
+
         hashes_match = (
-            actual_hash == hash_in_manifest or actual_equals_encoded_in_manifest or manifest_equals_encoded_in_actual
+            actual_hash == hash_in_manifest
+            or actual_hex == manifest_hex
         )
 
         return sizes_match and hashes_match
