@@ -239,9 +239,45 @@ class AbstractStorage(abc.ABC):
         )
         return blob.last_modified
 
+    # -------------------------------
+    # Hash helpers
+    # -------------------------------
     @staticmethod
-    def hashes_match(manifest_hash, object_hash):
-        return base64.b64decode(manifest_hash).hex() == str(object_hash) or manifest_hash == str(object_hash)
+    def _normalize_hash(value: t.Optional[str]) -> t.Optional[str]:
+        """Normalize a hash string to lowercase hex for comparison.
+
+        Accepts either base64-encoded MD5 or a hex string. Returns None when
+        the input is None/empty or cannot be decoded as base64 nor parsed as hex.
+        """
+        if not value:
+            return None
+        # Try base64 -> hex first
+        try:
+            return base64.b64decode(value, validate=False).hex()
+        except Exception:
+            pass
+        # Try hex normalization
+        try:
+            int(value, 16)
+            return value.lower()
+        except Exception:
+            return None
+
+    @staticmethod
+    def hashes_match(manifest_hash: t.Optional[str], object_hash: t.Optional[str]) -> bool:
+        """Compare two hashes safely.
+
+        Handles base64 vs hex and None values. Returns False if either is missing
+        (callers should decide whether to fall back to size-only logic).
+        """
+        if not manifest_hash or not object_hash:
+            return False
+        m = AbstractStorage._normalize_hash(manifest_hash)
+        o = AbstractStorage._normalize_hash(object_hash)
+        if m is None or o is None:
+            return False
+        # Equality in normalized hex OR exact string equality for already-matching forms
+        return m == o or manifest_hash == object_hash
 
     @staticmethod
     def path_maybe_with_parent(dest: str, src_path: Path) -> str:
@@ -339,7 +375,7 @@ class AbstractStorage(abc.ABC):
         checksum = checksum.digest()
         # Convert into a bytes type that can be base64 encoded
         base64_md5 = base64.encodebytes(checksum).decode('UTF-8').strip()
-        # Print the Base64 encoded CRC32C
+        # Return the Base64-encoded MD5 (GCS/Medusa convention for manifests)
         return base64_md5
 
     @staticmethod
