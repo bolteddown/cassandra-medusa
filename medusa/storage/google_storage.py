@@ -29,12 +29,7 @@ from retrying import retry
 
 from gcloud.aio.storage import Storage
 
-from medusa.storage.abstract_storage import (
-    AbstractStorage,
-    AbstractBlob,
-    ManifestObject,
-    ObjectDoesNotExistError,
-)
+from medusa.storage.abstract_storage import AbstractStorage, AbstractBlob, ManifestObject, ObjectDoesNotExistError
 
 
 DOWNLOAD_STREAM_CONSUMPTION_CHUNK_SIZE = 1024 * 1024 * 5
@@ -42,48 +37,10 @@ GOOGLE_MAX_FILES_PER_CHUNK = 64
 MAX_UP_DOWN_LOAD_RETRIES = 5
 
 
-# -------------------------------
-# Helpers
-# -------------------------------
-
-def _parse_gcs_datetime(ts: str) -> datetime.datetime:
-    """Parse GCS RFC3339-like timestamps with or without fractional seconds.
-
-    Examples from GCS:
-      2023-08-31T14:23:24.957Z
-      2023-08-31T14:23:24Z
-    """
-    if not ts:
-        return datetime.datetime.utcfromtimestamp(0)
-    for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ"):
-        try:
-            return datetime.datetime.strptime(ts, fmt)
-        except ValueError:
-            continue
-    # Fallback
-    return datetime.datetime.utcfromtimestamp(0)
-
-
-def _safe_md5_from_dict(d: dict) -> t.Optional[str]:
-    """Return md5Hash from a metadata dict if present, else None.
-    Some GCS objects legitimately have no md5Hash (e.g., composites or certain upload paths).
-    """
-    return (d or {}).get("md5Hash")
-
-
-def _safe_b64_to_hex(b64_str: str) -> t.Optional[str]:
-    """Convert a base64 string into lowercase hex. Return None on errors or empty input."""
-    if not b64_str:
-        return None
-    try:
-        return base64.b64decode(b64_str).hex()
-    except Exception:
-        return None
-
-
 class GoogleStorage(AbstractStorage):
 
     session = None
+    gcs_storage = None
 
     def __init__(self, config):
         if config.key_file is not None:
@@ -120,70 +77,106 @@ class GoogleStorage(AbstractStorage):
 
     async def _disconnect(self):
         try:
-            await self.gcs_storage.close()
-            await self.session.close()
+            if getattr(self, "gcs_storage", None):
+                await self.gcs_storage.close()
+            if getattr(self, "session", None):
+                await self.session.close()
         except Exception as e:
             logging.error('Error disconnecting from Google Storage: {}'.format(e))
 
+    @retry(stop_max_attempt_number=MAX_UP_DOWN_LOAD_RETRIES, wait_fixed=5000)
+    async def _download_blob(self, src: str, dest: str):
+        self._ensure_session()
+        blob = await self._stat_blob(src)
+        object_key = blob.name
+
+        # ensure subfolder path if needed
+        src_path = Path(src)
+        file_path = AbstractStorage.path_maybe_with_parent(dest, src_path)
+
+        logging.debug(
+            '[Storage] Downloading gcs://{}/{} -> {}'.format(
+                self.config.bucket_name, object_key, file_path
+            )
+        )
+
+        try:
+            stream = await self.gcs_storage.download_stream(
+                bucket=self.bucket_name,
+                object_name=object_key,
+                timeout=self.read_timeout,
+            )
+            Path(file_path).parent.mkdir(parents=True, exist_ok=True)
+            async with aiofiles.open(file_path, 'wb') as f:
+                while True:
+                    chunk = await stream.read(DOWNLOAD_STREAM_CONSUMPTION_CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    await f.write(chunk)
+
+        except aiohttp.client_exceptions.ClientResponseError as cre:
+            logging.error('Error downloading file from gs://{}/{}: {}'.format(self.config.bucket_name, object_key, cre))
+            if cre.status == 404:
+                raise ObjectDoesNotExistError('Object {} does not exist'.format(object_key))
+            raise cre
+
     async def _list_blobs(self, prefix=None) -> t.List[AbstractBlob]:
+        self._ensure_session()
         objects = self._paginate_objects(prefix=prefix)
 
         blobs: t.List[AbstractBlob] = []
         async for o in objects:
-            # name is required; skip entries without it
             name = o.get('name')
             if not name:
                 continue
 
-            # size may be a string or missing
             size_raw = o.get('size')
             try:
                 size = int(size_raw) if size_raw is not None else 0
             except (TypeError, ValueError):
                 size = 0
 
-            # md5Hash is NOT guaranteed to exist
-            md5 = o.get('md5Hash')  # may be None; downstream code must tolerate this
+            md5 = o.get('md5Hash')  # may be None
 
-            # Prefer timeCreated; fall back to updated
             ts = o.get('timeCreated') or o.get('updated')
-            dt = _parse_gcs_datetime(ts)
+            dt = None
+            if ts:
+                for fmt in ('%Y-%m-%dT%H:%M:%S.%fZ', '%Y-%m-%dT%H:%M:%SZ'):
+                    try:
+                        dt = datetime.datetime.strptime(ts, fmt)
+                        break
+                    except ValueError:
+                        pass
+            if dt is None:
+                dt = datetime.datetime.utcfromtimestamp(0)
 
             storage_class = o.get('storageClass')
 
             blobs.append(AbstractBlob(name, size, md5, dt, storage_class))
 
         return blobs
-
+        
     async def _paginate_objects(self, prefix=None):
+        self._ensure_session()
 
         params = {'prefix': str(prefix)} if prefix else {}
 
         while True:
-
-            # fetch a page
             page = await self.gcs_storage.list_objects(
                 bucket=self.bucket_name,
                 params=params,
                 timeout=self.read_timeout,
             )
 
-            # got nothing, return from the function
             if page.get('items') is None:
                 return
 
-            # yield items in the page
             for o in page.get('items'):
                 yield o
 
-            # check for next page being available
-            next_page_token = page.get('nextPageToken', None)
-
-            # if there is no next page, return from the function
-            if next_page_token is None:
+            next_page_token = page.get('nextPageToken')
+            if not next_page_token:
                 return
-
-            # otherwise, prepare params for the next page
             params['pageToken'] = next_page_token
 
     @retry(stop_max_attempt_number=MAX_UP_DOWN_LOAD_RETRIES, wait_fixed=5000)
@@ -202,15 +195,30 @@ class GoogleStorage(AbstractStorage):
             force_resumable_upload=True,
             timeout=-1,
         )
-        # md5Hash may be missing depending on how GCS created the object
-        md5 = _safe_md5_from_dict(resp)
-        time_created = resp.get('timeCreated')
-        return AbstractBlob(
-            resp.get('name', object_key), int(resp.get('size', 0)), md5, _parse_gcs_datetime(time_created), None
-        )
 
-    @retry(stop_max_attempt_number=MAX_UP_DOWN_LOAD_RETRIES, wait_fixed=5000)
-    async def _download_blob(self, src: str, dest: str):
+        # safe getters
+        name = resp.get('name', object_key)
+        try:
+            size = int(resp.get('size', 0))
+        except (TypeError, ValueError):
+            size = 0
+        md5 = resp.get('md5Hash')  # may be None
+
+        # parse RFC3339 with or without fractional seconds
+        ts = resp.get('timeCreated') or resp.get('updated')
+        dt = None
+        if ts:
+            for fmt in ('%Y-%m-%dT%H:%M:%S.%fZ', '%Y-%m-%dT%H:%M:%SZ'):
+                try:
+                    dt = datetime.datetime.strptime(ts, fmt)
+                    break
+                except ValueError:
+                    pass
+        if dt is None:
+            dt = datetime.datetime.utcfromtimestamp(0)
+
+        return AbstractBlob(name, size, md5, dt, None)
+
         self._ensure_session()
         blob = await self._stat_blob(src)
         object_key = blob.name
@@ -253,13 +261,25 @@ class GoogleStorage(AbstractStorage):
             object_name=object_key,
             timeout=self.read_timeout,
         )
-        # Safe field extraction
         name = blob.get('name', object_key)
-        size = int(blob.get('size', 0))
-        md5 = _safe_md5_from_dict(blob)
-        time_created = _parse_gcs_datetime(blob.get('timeCreated') or blob.get('updated'))
+        try:
+            size = int(blob.get('size', 0))
+        except (TypeError, ValueError):
+            size = 0
+        md5 = blob.get('md5Hash')  # safe get to avoid KeyError if missing
+        ts = blob.get('timeCreated') or blob.get('updated')
+        dt = None
+        if ts:
+            for fmt in ('%Y-%m-%dT%H:%M:%S.%fZ', '%Y-%m-%dT%H:%M:%SZ'):
+                try:
+                    dt = datetime.datetime.strptime(ts, fmt)
+                    break
+                except ValueError:
+                    pass
+        if dt is None:
+            dt = datetime.datetime.utcfromtimestamp(0)
         storage_class = blob.get('storageClass')
-        return AbstractBlob(name, size, md5, time_created, storage_class)
+        return AbstractBlob(name, size, md5, dt, storage_class)
 
     @retry(stop_max_attempt_number=MAX_UP_DOWN_LOAD_RETRIES, wait_fixed=5000)
     async def _upload_blob(self, src: str, dest: str) -> ManifestObject:
@@ -283,7 +303,7 @@ class GoogleStorage(AbstractStorage):
                 new_name=object_key,
                 timeout=-1,
             )
-            resp = resp.get('resource', resp) or {}
+            resp = resp['resource']
         else:
             file_size = os.stat(src).st_size
             logging.debug(
@@ -299,11 +319,7 @@ class GoogleStorage(AbstractStorage):
                     force_resumable_upload=True,
                     timeout=-1,
                 )
-        # Build ManifestObject; md5 may be None
-        name = resp.get('name', object_key)
-        size = int(resp.get('size', 0))
-        md5 = _safe_md5_from_dict(resp)
-        mo = ManifestObject(name, size, md5)
+        mo = ManifestObject(resp['name'], int(resp['size']), resp['md5Hash'])
         return mo
 
     async def _get_object(self, object_key: str) -> AbstractBlob:
@@ -341,7 +357,7 @@ class GoogleStorage(AbstractStorage):
             actual_size=blob.size,
             size_in_manifest=object_in_manifest['size'],
             actual_hash=str(blob.hash) if enable_md5_checks else None,
-            hash_in_manifest=object_in_manifest.get('MD5'),
+            hash_in_manifest=object_in_manifest['MD5']
         )
 
     @staticmethod
@@ -350,7 +366,7 @@ class GoogleStorage(AbstractStorage):
             actual_size=src.stat().st_size,
             size_in_manifest=cached_item.size,
             actual_hash=AbstractStorage.generate_md5_hash(src) if enable_md5_checks else None,
-            hash_in_manifest=cached_item.MD5,
+            hash_in_manifest=cached_item.MD5
         )
 
     @staticmethod
@@ -359,16 +375,10 @@ class GoogleStorage(AbstractStorage):
         if not actual_hash:
             return sizes_match
 
-        # If a hash is provided locally but the manifest has no hash, we cannot verify
-        if not hash_in_manifest:
-            return False
-
-        actual_hex = _safe_b64_to_hex(actual_hash) or actual_hash
-        manifest_hex = _safe_b64_to_hex(hash_in_manifest) or hash_in_manifest
-
+        actual_equals_encoded_in_manifest = actual_hash == base64.b64decode(hash_in_manifest).hex()
+        manifest_equals_encoded_in_actual = hash_in_manifest == base64.b64decode(actual_hash).hex()
         hashes_match = (
-            actual_hash == hash_in_manifest
-            or actual_hex == manifest_hex
+            actual_hash == hash_in_manifest or actual_equals_encoded_in_manifest or manifest_equals_encoded_in_actual
         )
 
         return sizes_match and hashes_match
